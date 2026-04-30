@@ -88,8 +88,8 @@ gdf = gpd.GeoDataFrame(geometry=[Point(*c) for c in coords[:, :2]], crs="EPSG:43
 spatial_dist_graph(gdf, h_max=10_000)                            # GeoDataFrame -> geodesic
 ```
 
-See [`docs/design/distance_metrics.md`](docs/design/distance_metrics.md)
-for the validation matrix and the design rationale.
+See the docstring of `spatial_dist_graph` for the full metric/CRS
+validation rules.
 
 ### Dendrograms
 

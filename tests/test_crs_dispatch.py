@@ -1,9 +1,8 @@
 """Tests for CRS-aware metric dispatch in spatial_dist_graph.
 
-Covers the contract documented in ``docs/design/distance_metrics.md``:
-auto-dispatch by CRS kind, the validation matrix, geopandas ingestion,
-the two-stage haversine-then-geodesic prefilter, and backward
-compatibility for the raw-ndarray path that the paper's benchmarks use.
+Covers auto-dispatch by CRS kind, the validation matrix, geopandas
+ingestion, the two-stage haversine-then-geodesic prefilter, and backward
+compatibility for the raw-ndarray path that the package's benchmarks use.
 """
 
 from __future__ import annotations

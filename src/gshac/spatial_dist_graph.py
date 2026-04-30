@@ -36,10 +36,9 @@ system, mirroring the design of R's ``sf::st_distance``. With
 * missing CRS    -> ``"euclidean"`` with a one-time ``UserWarning``
 
 Unlike sf, the default for geographic CRS is the ellipsoid, not the
-sphere; haversine remains explicitly available as a fast path. See
-``docs/design/distance_metrics.md`` for the full design rationale, the
-validation matrix, and the two-stage prefilter scheme used by the
-geodesic path.
+sphere; haversine remains explicitly available as a fast path. The
+geodesic path uses the haversine ball-tree as a prefilter and verifies
+each surviving candidate with ``pyproj.Geod.inv``.
 
 Dependencies
 ------------
@@ -78,17 +77,11 @@ Matches the constant baked into the C extension (``_gshac.haversine_edges``).
 """
 
 # Multiplier applied to ``h_max`` when prefiltering geodesic candidates with a
-# haversine ball-tree. Spherical haversine on a 6_371_000 m sphere can
-# under-estimate the true WGS-84 ellipsoidal distance because (i) the
-# ellipsoidal flattening is f ~= 1/298.257 (~0.34%), and (ii) the local
-# east-west scale at latitude phi differs from the spherical scale by a
-# factor that depends on phi. An empirical scan of (lat, dlat, dlon) shows
-# the worst-case ratio geodesic/haversine on this sphere reaches ~1.00449
-# at high latitudes for short east-west chords. 1.005 (= 0.5%) provides a
-# small additional margin against numerical wobble in BallTree's haversine
-# kernel. See ``docs/design/distance_metrics.md`` section "Two-stage
-# prefilter" and the test
-# ``tests/test_crs_dispatch.py::test_haversine_prefilter_safety``.
+# haversine ball-tree. The worst-case ratio geodesic/haversine on a
+# 6_371_000 m sphere reaches ~1.00449 at high latitudes for short east-west
+# chords (empirical scan of (lat, dlat, dlon) on WGS-84); 1.005 covers this
+# with a small margin for numerical wobble in BallTree's haversine kernel.
+# Pinned by ``tests/test_crs_dispatch.py::test_haversine_prefilter_safety``.
 _HAVERSINE_GEODESIC_SAFETY = 1.005
 
 
@@ -191,8 +184,7 @@ def _try_extract_from_geopandas(
     Non-Point geometries raise ``NotImplementedError`` with a message
     pointing at ``representative_point()`` / ``centroid``. Point-only is
     intentional for v0.x: HAC on lines and polygons requires a Hausdorff
-    or Frechet kernel that is out of scope for this release. See
-    ``docs/design/distance_metrics.md`` section "Limitations".
+    or Frechet kernel that is out of scope for this release.
     """
     # Check by class name first to avoid importing geopandas for ndarray inputs.
     cls_name = type(coords).__name__
@@ -221,7 +213,7 @@ def _try_extract_from_geopandas(
             f"{sorted(geom_types)!r}. For polygons/lines, use "
             "`geom.representative_point()` or `geom.centroid` to obtain a "
             "Point approximation. Hausdorff/Frechet distance for non-point "
-            "geometries is future work — see docs/design/distance_metrics.md."
+            "geometries is future work."
         )
 
     # Extract (x, y) — this is (lon, lat) for geographic CRSs.
@@ -410,13 +402,10 @@ def _geodesic_pairs(
 
     The motivation: building a separate spatial index on the ellipsoid would
     require either projecting to ECEF and using cKDTree (which gets the
-    chord wrong) or a custom bvh. The haversine ball-tree is already in the
-    sklearn dependency we use for the haversine path, and the worst-case
-    haversine-vs-geodesic discrepancy is small enough that a 0.3% inflation
-    of the prefilter radius admits no false negatives.
-
-    See ``docs/design/distance_metrics.md`` section "Two-stage prefilter"
-    for the full rationale.
+    chord wrong) or a custom bvh. The haversine ball-tree is already used
+    by the haversine path, and the worst-case haversine-vs-geodesic
+    discrepancy is small enough that a ~0.5% inflation of the prefilter
+    radius admits no false negatives.
     """
     try:
         from pyproj import Geod
@@ -485,7 +474,7 @@ def spatial_dist_graph(
           sphere for geographic CRSs.
         * ``"geodesic"`` — exact WGS-84 ellipsoidal distance via
           ``pyproj.Geod.inv``; uses a haversine ball-tree prefilter with a
-          0.3% safety factor (see ``_HAVERSINE_GEODESIC_SAFETY``).
+          0.5% safety factor (see ``_HAVERSINE_GEODESIC_SAFETY``).
           Geographic / missing CRS only.
         * ``"haversine"`` — spherical great-circle distance with mean Earth
           radius ``EARTH_RADIUS_M``. Geographic / missing CRS only. Used by
@@ -505,8 +494,8 @@ def spatial_dist_graph(
     ------
     ValueError
         If ``coords`` has fewer than 2 points, the metric is unknown, or the
-        ``(metric, CRS)`` combination is invalid (see the validation matrix
-        in ``docs/design/distance_metrics.md``).
+        ``(metric, CRS)`` combination is invalid (e.g. ``"euclidean"`` on a
+        geographic CRS, or ``"haversine"``/``"geodesic"`` on a projected CRS).
     NotImplementedError
         If a non-Point geometry is passed via ``GeoSeries`` /
         ``GeoDataFrame``.
