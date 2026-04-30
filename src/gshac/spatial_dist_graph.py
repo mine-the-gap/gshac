@@ -60,12 +60,17 @@ Matches the constant baked into the C extension (``_gshac.haversine_edges``).
 
 # Multiplier applied to ``h_max`` when prefiltering geodesic candidates with a
 # haversine ball-tree. Spherical haversine on a 6_371_000 m sphere can
-# under-estimate the true WGS-84 ellipsoidal distance by at most ~0.27%
-# (worst case is high-latitude E-W chords). 1.003 (=0.3%) is a safe upper
-# bound that admits no false negatives. See ``docs/design/distance_metrics.md``
-# section "Two-stage prefilter" and the test
+# under-estimate the true WGS-84 ellipsoidal distance because (i) the
+# ellipsoidal flattening is f ~= 1/298.257 (~0.34%), and (ii) the local
+# east-west scale at latitude phi differs from the spherical scale by a
+# factor that depends on phi. An empirical scan of (lat, dlat, dlon) shows
+# the worst-case ratio geodesic/haversine on this sphere reaches ~1.00449
+# at high latitudes for short east-west chords. 1.005 (= 0.5%) provides a
+# small additional margin against numerical wobble in BallTree's haversine
+# kernel. See ``docs/design/distance_metrics.md`` section "Two-stage
+# prefilter" and the test
 # ``tests/test_crs_dispatch.py::test_haversine_prefilter_safety``.
-_HAVERSINE_GEODESIC_SAFETY = 1.003
+_HAVERSINE_GEODESIC_SAFETY = 1.005
 
 
 _MetricStr = Literal["auto", "euclidean", "haversine", "geodesic"]
