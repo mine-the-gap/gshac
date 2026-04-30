@@ -125,18 +125,86 @@ def _resolve_inputs(
     coords: Any,
     crs: Any,
 ) -> Tuple[np.ndarray, Optional[Any]]:
-    """Normalise ``coords`` into ``(ndarray, pyproj.CRS|None)``.
+    """Normalise ``coords`` and ``crs`` into ``(ndarray, pyproj.CRS|None)``.
 
-    For now only raw ndarray inputs are accepted; geopandas ingestion is
-    added in a follow-up commit. Validates shape and accepts a
-    pyproj-acceptable ``crs=`` spec.
+    Accepts a raw ``(n, 2)`` ndarray, a ``geopandas.GeoSeries`` of points,
+    or a ``geopandas.GeoDataFrame``. If ``coords`` carries its own CRS,
+    the user-supplied ``crs=`` must either be ``None`` or match exactly —
+    a mismatch indicates a copy-paste bug, not a useful override.
     """
+    geo_coords, geo_crs = _try_extract_from_geopandas(coords)
+    if geo_coords is not None:
+        if crs is not None:
+            user_crs = _coerce_crs(crs)
+            if geo_crs is None:
+                # Caller passed a CRS for a geopandas object that has none;
+                # treat that as informational and adopt it.
+                geo_crs = user_crs
+            elif user_crs != geo_crs:
+                raise ValueError(
+                    "crs= argument does not match the CRS of the geopandas "
+                    f"input: argument={user_crs!r} vs input.crs={geo_crs!r}. "
+                    "Pass crs=None or omit to inherit the input's CRS."
+                )
+        return geo_coords, geo_crs
+
     arr = np.asarray(coords, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] != 2:
         raise ValueError(
             f"coords must be shape (n, 2); got shape {arr.shape!r}."
         )
     return arr, _coerce_crs(crs)
+
+
+def _try_extract_from_geopandas(
+    coords: Any,
+) -> Tuple[Optional[np.ndarray], Optional[Any]]:
+    """If ``coords`` is a geopandas object, return ``(arr, crs)``.
+
+    Otherwise return ``(None, None)``. ``geopandas`` is imported lazily so
+    that gshac remains importable without the ``[geo]`` extras.
+
+    Non-Point geometries raise ``NotImplementedError`` with a message
+    pointing at ``representative_point()`` / ``centroid``. Point-only is
+    intentional for v0.x: HAC on lines and polygons requires a Hausdorff
+    or Frechet kernel that is out of scope for this release. See
+    ``docs/design/distance_metrics.md`` section "Limitations".
+    """
+    # Check by class name first to avoid importing geopandas for ndarray inputs.
+    cls_name = type(coords).__name__
+    if cls_name not in ("GeoSeries", "GeoDataFrame"):
+        return None, None
+
+    try:
+        import geopandas as gpd
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "geopandas is required to pass GeoSeries / GeoDataFrame inputs. "
+            "Install via `pip install gshac[geo]`."
+        ) from e
+
+    if isinstance(coords, gpd.GeoDataFrame):
+        geom = coords.geometry
+    elif isinstance(coords, gpd.GeoSeries):
+        geom = coords
+    else:  # pragma: no cover - defensive, matched by class-name check above
+        return None, None
+
+    geom_types = set(geom.geom_type.unique())
+    if geom_types - {"Point"}:
+        raise NotImplementedError(
+            "Only Point geometries are supported in v0.x; got "
+            f"{sorted(geom_types)!r}. For polygons/lines, use "
+            "`geom.representative_point()` or `geom.centroid` to obtain a "
+            "Point approximation. Hausdorff/Frechet distance for non-point "
+            "geometries is future work — see docs/design/distance_metrics.md."
+        )
+
+    # Extract (x, y) — this is (lon, lat) for geographic CRSs.
+    xs = geom.x.to_numpy(dtype=np.float64)
+    ys = geom.y.to_numpy(dtype=np.float64)
+    arr = np.column_stack([xs, ys])
+    return arr, geom.crs
 
 
 def _resolve_metric(metric: str, crs_kind: str) -> str:
@@ -362,7 +430,7 @@ def _geodesic_pairs(
 # ---------------------------------------------------------------------------
 
 def spatial_dist_graph(
-    coords: np.ndarray,
+    coords: Union[np.ndarray, "Any"],
     h_max: float,
     metric: _MetricStr = "auto",
     crs: Any = None,
@@ -371,11 +439,14 @@ def spatial_dist_graph(
 
     Parameters
     ----------
-    coords : ndarray, shape (n, 2)
-        Feature coordinates. For a geographic CRS the ordering is
-        ``(longitude, latitude)`` in degrees; for a projected CRS, ``(x, y)``
-        in the CRS's linear units (metres assumed for ``h_max`` to be
-        meaningful — see Notes).
+    coords : ndarray of shape (n, 2), or geopandas.GeoSeries, or geopandas.GeoDataFrame
+        Feature coordinates. For a ndarray with a geographic CRS the
+        ordering is ``(longitude, latitude)`` in degrees; for a projected
+        CRS, ``(x, y)`` in the CRS's linear units (metres assumed for
+        ``h_max`` to be meaningful — see Notes). For ``GeoSeries`` /
+        ``GeoDataFrame`` inputs, only Point geometries are supported in
+        v0.x; non-Point inputs raise ``NotImplementedError`` with a
+        suggestion to use ``representative_point()`` or ``centroid``.
     h_max : float
         Maximum distance threshold. Metres for ``"haversine"``, ``"geodesic"``,
         and ``"euclidean"`` on a metre-unit projected CRS. For ``"euclidean"``
@@ -412,6 +483,13 @@ def spatial_dist_graph(
         If ``coords`` has fewer than 2 points, the metric is unknown, or the
         ``(metric, CRS)`` combination is invalid (see the validation matrix
         in ``docs/design/distance_metrics.md``).
+    NotImplementedError
+        If a non-Point geometry is passed via ``GeoSeries`` /
+        ``GeoDataFrame``.
+    ImportError
+        If ``metric`` resolves to ``"geodesic"`` but ``pyproj`` is not
+        installed, or a geopandas input is passed but ``geopandas`` is not
+        installed.
 
     Notes
     -----
@@ -476,7 +554,7 @@ def spatial_dist_graph(
 
 
 def geographic_connectivity(
-    coords: np.ndarray,
+    coords: Union[np.ndarray, "Any"],
     h_max: float,
     metric: _MetricStr = "auto",
     crs: Any = None,
