@@ -20,7 +20,7 @@ plot = [
 ]
 geo = [
     "geopandas>=0.14",
-    "pyproj>=3.6",
+    "pyproj>=3.7",
 ]
 benchmark = [
     "gshac[plot,geo]",
