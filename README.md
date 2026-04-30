@@ -67,6 +67,30 @@ result = sparse_hclust(graph, h_cuts=[5_000, 10_000], method="single")
 # result["labels"][5000] -> cluster labels at 5 km cut
 ```
 
+### Geographic data and CRS
+
+`spatial_dist_graph` is CRS-aware. With `metric="auto"` (the default), the
+metric is chosen from the CRS: geographic -> geodesic (WGS-84 via
+`pyproj.Geod`), projected -> euclidean, missing CRS -> euclidean (with a
+one-time `UserWarning`). Combinations like euclidean on a geographic CRS,
+or haversine/geodesic on a projected CRS, are rejected up front. Three
+input forms are accepted:
+
+```python
+import numpy as np, geopandas as gpd
+from shapely.geometry import Point
+from gshac import spatial_dist_graph
+
+coords = np.random.default_rng(0).uniform(0, 500_000, size=(5_000, 2))
+spatial_dist_graph(coords, h_max=10_000)                         # ndarray, missing CRS
+spatial_dist_graph(coords, h_max=10_000, crs="EPSG:3857")        # ndarray + explicit CRS
+gdf = gpd.GeoDataFrame(geometry=[Point(*c) for c in coords[:, :2]], crs="EPSG:4326")
+spatial_dist_graph(gdf, h_max=10_000)                            # GeoDataFrame -> geodesic
+```
+
+See the docstring of `spatial_dist_graph` for the full metric/CRS
+validation rules.
+
 ### Dendrograms
 
 ```python
@@ -127,11 +151,11 @@ pytest tests/ -v
 
 | Function / Class | Description |
 |---|---|
-| `spatial_dist_graph(coords, h_max, metric)` | Build sparse distance graph (CSR matrix) |
+| `spatial_dist_graph(coords, h_max, metric, crs)` | Build sparse distance graph (CSR matrix); CRS-aware metric dispatch |
 | `sparse_hclust(graph, h_cuts, method, return_linkage)` | Component-wise HAC on the sparse graph |
 | `stitch_linkage(result)` | Combine per-component Z matrices into one |
 | `SparseAgglomerativeClustering` | sklearn-compatible estimator |
-| `geographic_connectivity(coords, h_max, metric)` | Binary connectivity matrix for sklearn |
+| `geographic_connectivity(coords, h_max, metric, crs)` | Binary connectivity matrix for sklearn |
 | `plot_dendrogram(model_or_result, ...)` | Plot dendrogram from estimator or result |
 | `plot_component_dendrograms(result, top_k)` | Plot dendrograms for largest components |
 
