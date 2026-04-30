@@ -18,17 +18,36 @@ The algorithm:
 
 Public API
 ----------
-spatial_dist_graph(coords, h_max, metric, crs=None)
+spatial_dist_graph(coords, h_max, metric="auto", crs=None)
     Full sparse distance graph (distances stored as edge weights).
 
-geographic_connectivity(coords, h_max, metric, crs=None)
+geographic_connectivity(coords, h_max, metric="auto", crs=None)
     Binary connectivity matrix for use with
     ``sklearn.cluster.AgglomerativeClustering(connectivity=...)``.
+
+CRS-aware dispatch
+------------------
+The ``metric`` argument is conditional on the coordinate reference
+system, mirroring the design of R's ``sf::st_distance``. With
+``metric="auto"`` (the default), gshac dispatches as follows:
+
+* geographic CRS -> ``"geodesic"`` (ellipsoidal, via ``pyproj.Geod.inv``)
+* projected CRS  -> ``"euclidean"``
+* missing CRS    -> ``"euclidean"`` with a one-time ``UserWarning``
+
+Unlike sf, the default for geographic CRS is the ellipsoid, not the
+sphere; haversine remains explicitly available as a fast path. See
+``docs/design/distance_metrics.md`` for the full design rationale, the
+validation matrix, and the two-stage prefilter scheme used by the
+geodesic path.
 
 Dependencies
 ------------
 * numpy, scipy, scikit-learn (always)
-* pyproj (optional, for CRS introspection)
+* pyproj (only when ``metric`` resolves to ``"geodesic"`` or ``crs=`` is
+  set; install via ``pip install gshac[geo]``)
+* geopandas (only when passing a ``GeoSeries`` / ``GeoDataFrame``;
+  install via ``pip install gshac[geo]``)
 """
 
 from __future__ import annotations
