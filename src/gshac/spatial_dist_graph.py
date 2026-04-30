@@ -57,9 +57,18 @@ EARTH_RADIUS_M = 6_371_000.0
 Matches the constant baked into the C extension (``_gshac.haversine_edges``).
 """
 
+# Multiplier applied to ``h_max`` when prefiltering geodesic candidates with a
+# haversine ball-tree. Spherical haversine on a 6_371_000 m sphere can
+# under-estimate the true WGS-84 ellipsoidal distance by at most ~0.27%
+# (worst case is high-latitude E-W chords). 1.003 (=0.3%) is a safe upper
+# bound that admits no false negatives. See ``docs/design/distance_metrics.md``
+# section "Two-stage prefilter" and the test
+# ``tests/test_crs_dispatch.py::test_haversine_prefilter_safety``.
+_HAVERSINE_GEODESIC_SAFETY = 1.003
 
-_MetricStr = Literal["euclidean", "haversine"]
-_VALID_METRICS = ("euclidean", "haversine")
+
+_MetricStr = Literal["euclidean", "haversine", "geodesic"]
+_VALID_METRICS = ("euclidean", "haversine", "geodesic")
 
 
 # ---------------------------------------------------------------------------
@@ -161,17 +170,27 @@ def _euclidean_pairs(
 def _haversine_pairs(
     coords: np.ndarray,
     h_max: float,
+    h_max_rad_factor: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Candidate pairs (upper triangle) and exact haversine distances.
 
-    ``coords`` is ``(lon, lat)`` in degrees; ``h_max`` is metres on a sphere
-    of radius ``EARTH_RADIUS_M``.
+    Parameters
+    ----------
+    coords : ndarray (n, 2)
+        ``(lon, lat)`` in degrees.
+    h_max : float
+        Distance threshold in metres on a sphere of radius ``EARTH_RADIUS_M``.
+    h_max_rad_factor : float
+        Multiplier applied to the ball-tree query radius. Used by the
+        geodesic path to enlarge the prefilter; a value of 1.0 gives the
+        standard haversine path with byte-identical results to prior
+        releases.
     """
     from sklearn.neighbors import BallTree
 
     n = len(coords)
     coords_rad = np.radians(coords[:, [1, 0]])  # swap lon/lat -> lat/lon
-    h_max_rad = h_max / EARTH_RADIUS_M
+    h_max_rad = (h_max * h_max_rad_factor) / EARTH_RADIUS_M
 
     tree = BallTree(coords_rad, metric="haversine")
     indices = tree.query_radius(coords_rad, r=h_max_rad)
@@ -202,6 +221,59 @@ def _haversine_pairs(
     return pairs, dists
 
 
+def _geodesic_pairs(
+    coords: np.ndarray,
+    h_max: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Candidate pairs and exact WGS-84 ellipsoidal distances.
+
+    Two-stage scheme: a haversine ball-tree on a sphere of radius
+    ``EARTH_RADIUS_M`` provides the prefilter (with the radius enlarged by
+    ``_HAVERSINE_GEODESIC_SAFETY``), and ``pyproj.Geod.inv`` computes the
+    exact ellipsoidal distance for the surviving candidates. Pairs whose
+    true geodesic distance exceeds ``h_max`` are dropped.
+
+    The motivation: building a separate spatial index on the ellipsoid would
+    require either projecting to ECEF and using cKDTree (which gets the
+    chord wrong) or a custom bvh. The haversine ball-tree is already in the
+    sklearn dependency we use for the haversine path, and the worst-case
+    haversine-vs-geodesic discrepancy is small enough that a 0.3% inflation
+    of the prefilter radius admits no false negatives.
+
+    See ``docs/design/distance_metrics.md`` section "Two-stage prefilter"
+    for the full rationale.
+    """
+    try:
+        from pyproj import Geod
+    except ImportError as e:
+        raise ImportError(
+            'metric="geodesic" requires pyproj. '
+            "Install via `pip install gshac[geo]`."
+        ) from e
+
+    pairs, _ = _haversine_pairs(
+        coords, h_max, h_max_rad_factor=_HAVERSINE_GEODESIC_SAFETY,
+    )
+    if len(pairs) == 0:
+        return pairs, np.empty((0,), dtype=np.float64)
+
+    geod = Geod(ellps="WGS84")
+    lon1 = coords[pairs[:, 0], 0]
+    lat1 = coords[pairs[:, 0], 1]
+    lon2 = coords[pairs[:, 1], 0]
+    lat2 = coords[pairs[:, 1], 1]
+    # Geod.inv returns (forward azimuth, back azimuth, distance_m); we only
+    # need the distance.
+    _, _, dists = geod.inv(lon1, lat1, lon2, lat2)
+    dists = np.asarray(dists, dtype=np.float64)
+
+    # Drop pairs whose exact ellipsoidal distance exceeds h_max. The
+    # haversine prefilter is conservative (admits some pairs slightly beyond
+    # h_max because of the safety factor), so this final filter is required.
+    keep = dists <= h_max
+    return pairs[keep], dists[keep]
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -222,9 +294,12 @@ def spatial_dist_graph(
         degrees.
     h_max : float
         Maximum distance threshold in metres.
-    metric : {"euclidean", "haversine"}, default "euclidean"
+    metric : {"euclidean", "haversine", "geodesic"}, default "euclidean"
         Distance metric. ``"haversine"`` is the spherical great-circle
-        distance with mean Earth radius ``EARTH_RADIUS_M``.
+        distance with mean Earth radius ``EARTH_RADIUS_M``. ``"geodesic"``
+        is the exact WGS-84 ellipsoidal distance computed via
+        ``pyproj.Geod.inv``; it uses a haversine ball-tree as a prefilter
+        with a small safety factor (see ``_HAVERSINE_GEODESIC_SAFETY``).
     crs : pyproj.CRS or pyproj-acceptable spec (str, int EPSG code), optional
         Coordinate reference system metadata. Currently used for validation
         only; full CRS-aware dispatch is added in a follow-up commit.
@@ -247,6 +322,8 @@ def spatial_dist_graph(
         pairs, dists = _euclidean_pairs(arr, h_max)
     elif resolved_metric == "haversine":
         pairs, dists = _haversine_pairs(arr, h_max)
+    elif resolved_metric == "geodesic":
+        pairs, dists = _geodesic_pairs(arr, h_max)
     else:  # pragma: no cover
         raise AssertionError(f"unreachable: metric={resolved_metric!r}")
 
