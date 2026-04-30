@@ -33,6 +33,7 @@ Dependencies
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -67,8 +68,13 @@ Matches the constant baked into the C extension (``_gshac.haversine_edges``).
 _HAVERSINE_GEODESIC_SAFETY = 1.003
 
 
-_MetricStr = Literal["euclidean", "haversine", "geodesic"]
-_VALID_METRICS = ("euclidean", "haversine", "geodesic")
+_MetricStr = Literal["auto", "euclidean", "haversine", "geodesic"]
+_VALID_METRICS = ("auto", "euclidean", "haversine", "geodesic")
+
+# One-time warning state for missing-CRS auto-dispatch. Reset is intentionally
+# not exposed: tests that need to re-trigger the warning manipulate this
+# module-level flag directly via monkeypatch.
+_MISSING_CRS_WARNED = False
 
 
 # ---------------------------------------------------------------------------
@@ -134,18 +140,95 @@ def _resolve_inputs(
 
 
 def _resolve_metric(metric: str, crs_kind: str) -> str:
-    """Validate ``(metric, CRS kind)`` and return the resolved metric.
+    """Resolve ``metric="auto"`` to a concrete metric and validate the pair.
 
-    Currently a pure validator: it does not auto-dispatch. A follow-up commit
-    adds ``"auto"`` and the geographic <-> geodesic mapping. Centralising the
-    validation matrix in this function lets later commits extend the dispatch
-    without touching the call site in ``spatial_dist_graph``.
+    The validation matrix mirrors R's ``sf::st_distance``: distances on a
+    geographic CRS must be spherical or ellipsoidal; distances on a
+    projected CRS must be planar; mixing the two is a user error.
+
+    Resolution rules:
+
+    * ``"auto"`` — dispatch on CRS kind. Geographic -> ``"geodesic"``,
+      projected -> ``"euclidean"``, missing -> ``"euclidean"`` with a
+      one-time ``UserWarning`` advising the caller to set the CRS.
+    * ``"geodesic"`` / ``"haversine"`` — require a geographic CRS or
+      missing CRS. Reject projected CRSs because lon/lat trig on projected
+      coordinates is silently wrong.
+    * ``"euclidean"`` — require a projected or missing CRS. Reject
+      geographic CRSs because degree differences are not metres; sf would
+      not even offer this combination.
     """
     if metric not in _VALID_METRICS:
         raise ValueError(
             f"Unknown metric: {metric!r}. Use one of {_VALID_METRICS!r}."
         )
-    return metric
+
+    if metric == "auto":
+        if crs_kind == "geographic":
+            return "geodesic"
+        if crs_kind == "projected":
+            return "euclidean"
+        # Missing CRS: warn once per process and assume planar.
+        global _MISSING_CRS_WARNED
+        if not _MISSING_CRS_WARNED:
+            warnings.warn(
+                "CRS not set; assuming planar coordinates. Pass crs= or use "
+                "a GeoDataFrame to silence this warning.",
+                UserWarning,
+                stacklevel=3,
+            )
+            _MISSING_CRS_WARNED = True
+        return "euclidean"
+
+    if metric in ("haversine", "geodesic"):
+        if crs_kind == "projected":
+            raise ValueError(
+                f"metric={metric!r} requires geographic (lon/lat) coordinates "
+                "but a projected CRS was provided. Either pass "
+                'metric="euclidean" or reproject your data to a geographic '
+                "CRS (e.g. EPSG:4326)."
+            )
+        # Missing-CRS + spherical/ellipsoidal: allow without warning. The
+        # caller has explicitly chosen the metric, so they have asserted
+        # that the coordinates are lon/lat.
+        return metric
+
+    if metric == "euclidean":
+        if crs_kind == "geographic":
+            raise ValueError(
+                'metric="euclidean" is invalid for a geographic (lon/lat) '
+                'CRS: degree differences are not metres. Use metric="auto", '
+                '"geodesic", or "haversine" instead, or reproject your data '
+                "to a projected CRS first."
+            )
+        return "euclidean"
+
+    raise AssertionError(f"unreachable: metric={metric!r}")  # pragma: no cover
+
+
+def _check_metre_units(crs: Any) -> None:
+    """Warn if a projected CRS does not use linear-metre axis units.
+
+    ``h_max`` is documented as metres; if the CRS is projected in feet or
+    degrees, the result will be wrong. We surface a ``UserWarning`` rather
+    than erroring because some users legitimately work in input units (e.g.
+    cartesian simulation coords with ``crs=None``); the warning gives them
+    a nudge to either reproject or accept the unit mismatch consciously.
+    """
+    if crs is None or not crs.is_projected:
+        return
+    try:
+        unit = crs.axis_info[0].unit_name
+    except (AttributeError, IndexError):
+        return
+    if unit and unit not in ("metre", "meter", "metres", "meters"):
+        warnings.warn(
+            f"Projected CRS {crs.name!r} uses axis unit {unit!r}, not metres; "
+            "h_max is interpreted in input units. To compute distances in "
+            "metres, reproject to a CRS with metre axes (e.g. UTM).",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +364,7 @@ def _geodesic_pairs(
 def spatial_dist_graph(
     coords: np.ndarray,
     h_max: float,
-    metric: _MetricStr = "euclidean",
+    metric: _MetricStr = "auto",
     crs: Any = None,
 ) -> dict:
     """Build a sparse geographic distance graph.
@@ -289,25 +372,53 @@ def spatial_dist_graph(
     Parameters
     ----------
     coords : ndarray, shape (n, 2)
-        Feature coordinates. For ``metric="euclidean"``: ``(x, y)`` in metres
-        (projected CRS). For ``metric="haversine"``: ``(lon, lat)`` in
-        degrees.
+        Feature coordinates. For a geographic CRS the ordering is
+        ``(longitude, latitude)`` in degrees; for a projected CRS, ``(x, y)``
+        in the CRS's linear units (metres assumed for ``h_max`` to be
+        meaningful — see Notes).
     h_max : float
-        Maximum distance threshold in metres.
-    metric : {"euclidean", "haversine", "geodesic"}, default "euclidean"
-        Distance metric. ``"haversine"`` is the spherical great-circle
-        distance with mean Earth radius ``EARTH_RADIUS_M``. ``"geodesic"``
-        is the exact WGS-84 ellipsoidal distance computed via
-        ``pyproj.Geod.inv``; it uses a haversine ball-tree as a prefilter
-        with a small safety factor (see ``_HAVERSINE_GEODESIC_SAFETY``).
+        Maximum distance threshold. Metres for ``"haversine"``, ``"geodesic"``,
+        and ``"euclidean"`` on a metre-unit projected CRS. For ``"euclidean"``
+        with a missing CRS, ``h_max`` is in input units.
+    metric : {"auto", "euclidean", "haversine", "geodesic"}, default "auto"
+        Distance metric.
+
+        * ``"auto"`` — dispatch on the detected CRS: geographic ->
+          ``"geodesic"``, projected -> ``"euclidean"``, missing ->
+          ``"euclidean"`` with a one-time ``UserWarning``. Mirrors
+          ``sf::st_distance`` (R) but defaults to ellipsoid rather than
+          sphere for geographic CRSs.
+        * ``"geodesic"`` — exact WGS-84 ellipsoidal distance via
+          ``pyproj.Geod.inv``; uses a haversine ball-tree prefilter with a
+          0.3% safety factor (see ``_HAVERSINE_GEODESIC_SAFETY``).
+          Geographic / missing CRS only.
+        * ``"haversine"`` — spherical great-circle distance with mean Earth
+          radius ``EARTH_RADIUS_M``. Geographic / missing CRS only. Used by
+          the paper's benchmarks; preserved as the fast path.
+        * ``"euclidean"`` — planar L2 distance. Projected / missing CRS only.
+
     crs : pyproj.CRS or pyproj-acceptable spec (str, int EPSG code), optional
-        Coordinate reference system metadata. Currently used for validation
-        only; full CRS-aware dispatch is added in a follow-up commit.
+        Coordinate reference system metadata. Together with ``metric``
+        determines the dispatch and validation matrix.
 
     Returns
     -------
     dict with keys ``matrix``, ``components``, ``n_components``, ``n_edges``,
     ``density``. See module docstring for details.
+
+    Raises
+    ------
+    ValueError
+        If ``coords`` has fewer than 2 points, the metric is unknown, or the
+        ``(metric, CRS)`` combination is invalid (see the validation matrix
+        in ``docs/design/distance_metrics.md``).
+
+    Notes
+    -----
+    Backward compatibility: calling ``spatial_dist_graph(arr, h_max,
+    metric="haversine")`` or ``metric="euclidean"`` on a raw ndarray with no
+    ``crs=`` is byte-identical to the pre-CRS-aware behaviour. The paper's
+    benchmark numbers depend on this.
     """
     arr, resolved_crs = _resolve_inputs(coords, crs)
     n = len(arr)
@@ -316,6 +427,11 @@ def spatial_dist_graph(
 
     kind = _crs_kind(resolved_crs)
     resolved_metric = _resolve_metric(metric, kind)
+
+    # Optional unit check for projected CRSs — a non-metre unit silently
+    # changes what h_max means, which is a footgun.
+    if resolved_metric == "euclidean":
+        _check_metre_units(resolved_crs)
 
     # --- candidate pairs + exact distances ---------------------------------
     if resolved_metric == "euclidean":
@@ -362,7 +478,7 @@ def spatial_dist_graph(
 def geographic_connectivity(
     coords: np.ndarray,
     h_max: float,
-    metric: _MetricStr = "euclidean",
+    metric: _MetricStr = "auto",
     crs: Any = None,
 ) -> "csr_matrix":
     """Binary connectivity matrix for use with sklearn AgglomerativeClustering.
