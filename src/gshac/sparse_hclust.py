@@ -3,11 +3,27 @@ sparse_hclust.py
 
 Hierarchical clustering using a sparse geographic distance graph.
 
-For each connected component of the graph, extracts the dense sub-matrix,
-converts to condensed form, runs scipy linkage, and cuts at the requested
+For each connected component of the graph, runs HAC and cuts at the requested
 height thresholds. Because inter-component distances are all > h_max, features
-in different components will not merge at any cut height h <= h_max. The result
-is therefore EXACT — not an approximation — for all linkage methods.
+in different components never merge at any cut height h <= h_max.
+
+Single linkage uses the component MST (no dense sub-matrix). Complete / average /
+Ward use a per-component dense sub-matrix: when ``coords`` are passed to
+``sparse_hclust`` the sub-matrix is recomputed exactly from coordinates; without
+``coords`` it is reconstructed from the threshold graph with a sentinel for
+absent (> h_max) pairs (exact for complete, approximate for average — pass
+``coords`` for exact average).
+
+Exactness guarantee for a cut at any ``h <= h_max``: GUARANTEED for single,
+complete, and average. These linkages have inter-cluster dissimilarity
+``D(A, B) >= min_{a in A, b in B} dist(a, b)``, so clusters in different
+components (every cross pair > h_max) never merge below h_max, and the
+per-component result equals the dense result. **Ward is NOT guaranteed**: its
+variance/centroid-based merge height is not bounded below by the minimum
+inter-point distance and can fall below h_max for clusters in different
+components (e.g. one component spatially surrounding another), so the
+per-component result may differ from a full dense Ward. Ward is exact in practice
+for spatially compact clusters.
 
 Also provides a dense baseline that computes the full O(n^2) distance matrix.
 
@@ -15,6 +31,8 @@ Dependencies: numpy, scipy
 """
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 from scipy.cluster.hierarchy import fcluster
@@ -42,6 +60,53 @@ try:
     _GSHAC_C = True
 except ImportError:
     _GSHAC_C = False
+
+
+_EARTH_RADIUS_M = 6_371_000.0  # matches spatial_dist_graph / dense_hclust haversine
+
+
+def _full_distance_matrix(coords_sub: np.ndarray, metric: str) -> np.ndarray:
+    """Full ``(m, m)`` pairwise distance matrix for one component's coordinates.
+
+    Uses the same metric and constants as ``spatial_dist_graph`` /
+    ``dense_hclust``. Required for *exact* complete / average / Ward linkage:
+    the threshold graph omits intra-component pairs farther than ``h_max``
+    apart, and those distances affect the merge heights of these linkages —
+    critically for average linkage, which averages them into the merge height.
+    """
+    if metric == "euclidean":
+        return cdist(coords_sub, coords_sub, metric="euclidean")
+    if metric == "haversine":
+        rad = np.radians(coords_sub[:, [1, 0]])          # (lat, lon) radians
+        lat = rad[:, 0][:, None]
+        lon = rad[:, 1][:, None]
+        dlat = lat - lat.T
+        dlon = lon - lon.T
+        a = (np.sin(dlat / 2.0) ** 2
+             + np.cos(lat) * np.cos(lat.T) * np.sin(dlon / 2.0) ** 2)
+        return 2.0 * _EARTH_RADIUS_M * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+    if metric == "geodesic":
+        try:
+            from pyproj import Geod
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                'metric="geodesic" requires pyproj for the exact non-single '
+                "linkage sub-matrix. Install via `pip install gshac[geo]`."
+            ) from e
+        geod = Geod(ellps="WGS84")
+        m = len(coords_sub)
+        ii, jj = np.meshgrid(np.arange(m), np.arange(m), indexing="ij")
+        lon = coords_sub[:, 0]
+        lat = coords_sub[:, 1]
+        _, _, d = geod.inv(lon[ii].ravel(), lat[ii].ravel(),
+                           lon[jj].ravel(), lat[jj].ravel())
+        D = np.asarray(d, dtype=np.float64).reshape(m, m)
+        np.fill_diagonal(D, 0.0)
+        return D
+    raise ValueError(
+        f"Unknown metric for exact sub-matrix: {metric!r}. "
+        "Use 'euclidean', 'haversine', or 'geodesic'."
+    )
 
 
 def _build_Z_from_mst(sub_csr: csr_matrix, size: int) -> np.ndarray:
@@ -121,6 +186,7 @@ def sparse_hclust(
     method: str = "single",
     ids: Optional[Sequence] = None,
     return_linkage: bool = False,
+    coords: Optional[np.ndarray] = None,
 ) -> dict:
     """
     Hierarchical clustering via sparse geographic distance graph.
@@ -145,6 +211,15 @@ def sparse_hclust(
 
         Use :func:`stitch_linkage` to combine these into a single ``(n - 1, 4)``
         matrix compatible with :func:`scipy.cluster.hierarchy.dendrogram`.
+    coords : ndarray of shape (n, 2), optional
+        The coordinates the graph was built from, in the same order. Required
+        for **exact average linkage** (and makes complete/Ward exact in
+        general): the per-component sub-matrix is recomputed from these
+        coordinates using the graph's metric, recovering the intra-component
+        distances beyond ``h_max`` that the threshold graph omits. Ignored for
+        single linkage. If omitted, non-single linkage falls back to a
+        threshold-graph + sentinel reconstruction — exact for single, complete,
+        and Ward, but approximate for average (a ``UserWarning`` is raised).
 
     Returns
     -------
@@ -164,6 +239,16 @@ def sparse_hclust(
     mat        = graph["matrix"]
     components = graph["components"]
     n          = mat.shape[0]
+    metric     = graph.get("metric", "euclidean")
+
+    coords_arr = None
+    if coords is not None:
+        coords_arr = np.asarray(coords, dtype=np.float64)
+        if coords_arr.shape != (n, 2):
+            raise ValueError(
+                f"coords must be shape (n, 2) matching the graph's {n} points; "
+                f"got shape {coords_arr.shape!r}."
+            )
 
     if ids is None:
         ids = list(range(n))
@@ -214,15 +299,31 @@ def sparse_hclust(
                 Z = _build_Z_from_mst(sub_csr, size)
         else:
             # Dense path for complete / average / Ward linkage.
-            sub = mat[np.ix_(idx, idx)].toarray()
-            np.fill_diagonal(sub, 0.0)
-
-            # Replace absent pairs with a sentinel > h_max so they never merge.
-            off_diag  = ~np.eye(size, dtype=bool)
-            zero_mask = off_diag & (sub == 0.0)
-            if zero_mask.any():
-                max_edge = sub[off_diag & (sub > 0.0)].max()
-                sub[zero_mask] = max_edge * 2
+            if coords_arr is not None:
+                # Exact: recompute the full per-component distance matrix from
+                # coordinates with the graph's metric. The threshold graph omits
+                # > h_max intra-component pairs, whose true distances drive
+                # complete/average/Ward merge heights (critically for average).
+                sub = _full_distance_matrix(coords_arr[idx], metric)
+            else:
+                # Fallback (no coords): reconstruct from the threshold graph and
+                # fill absent (> h_max) pairs with a sentinel. Exact for complete
+                # (max-dominated) and, in practice, Ward; approximate for average.
+                sub = mat[np.ix_(idx, idx)].toarray()
+                np.fill_diagonal(sub, 0.0)
+                off_diag  = ~np.eye(size, dtype=bool)
+                zero_mask = off_diag & (sub == 0.0)
+                if zero_mask.any():
+                    if method == "average":
+                        warnings.warn(
+                            "average linkage without coords= is approximate: "
+                            "intra-component pairs beyond h_max are filled with a "
+                            "sentinel that distorts averaged merge heights. Pass "
+                            "coords= to sparse_hclust for exact average linkage.",
+                            UserWarning, stacklevel=2,
+                        )
+                    max_edge = sub[off_diag & (sub > 0.0)].max()
+                    sub[zero_mask] = max_edge * 2
 
             Z = _linkage(squareform(sub, checks=False), method=method)
 

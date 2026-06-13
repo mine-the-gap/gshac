@@ -160,6 +160,56 @@ def test_sparse_matches_dense_exact_labels(backend):
                 )
 
 
+@pytest.mark.parametrize("method", ["single", "complete", "average", "ward"])
+def test_sparse_matches_dense_all_linkages(backend, method):
+    """With coords=, every linkage (incl. average) matches the dense baseline.
+
+    The threshold graph omits > h_max intra-component pairs; average linkage
+    averages those distances into its merge heights, so it is exact only when
+    the full per-component sub-matrix is recomputed from coordinates (the
+    coords= path). Regression guard for that path.
+    """
+    rng = np.random.default_rng(11)
+    coords = rng.uniform(0, 50_000, size=(300, 2))
+    h_max = 20_000
+    h_cuts = [5_000, 10_000, 15_000]
+
+    graph = spatial_dist_graph(coords, h_max=h_max)
+    sp = sparse_hclust(graph, h_cuts=h_cuts, method=method, coords=coords)
+    dn = dense_hclust(coords, h_cuts=h_cuts, method=method)
+
+    for h in h_cuts:
+        n_sp = len(np.unique(sp["labels"][float(h)]))
+        n_dn = len(np.unique(dn["labels"][float(h)]))
+        assert n_sp == n_dn, f"{method} mismatch at h={h}: sparse={n_sp}, dense={n_dn}"
+
+
+def test_haversine_average_matches_dense(backend):
+    """Exact average linkage on a haversine graph via the coords= path."""
+    rng = np.random.default_rng(5)
+    coords = np.column_stack([rng.uniform(-1.0, 1.0, 250),
+                              rng.uniform(50.0, 51.0, 250)])
+    h_cuts = [10_000, 20_000]
+    graph = spatial_dist_graph(coords, h_max=30_000, metric="haversine")
+    sp = sparse_hclust(graph, h_cuts=h_cuts, method="average", coords=coords)
+    dn = dense_hclust(coords, h_cuts=h_cuts, method="average", metric="haversine")
+    for h in h_cuts:
+        assert len(np.unique(sp["labels"][float(h)])) == \
+               len(np.unique(dn["labels"][float(h)]))
+
+
+def test_average_without_coords_warns_and_validates_shape():
+    """Average linkage without coords= warns (approximate); bad coords raise."""
+    rng = np.random.default_rng(11)
+    coords = rng.uniform(0, 50_000, size=(300, 2))
+    graph = spatial_dist_graph(coords, h_max=20_000)
+    with pytest.warns(UserWarning, match="average linkage without coords"):
+        sparse_hclust(graph, h_cuts=[10_000], method="average")
+    with pytest.raises(ValueError, match=r"coords must be shape"):
+        sparse_hclust(graph, h_cuts=[10_000], method="average",
+                      coords=coords[:, :1])
+
+
 # ---------------------------------------------------------------------------
 # return_linkage and stitch_linkage
 # ---------------------------------------------------------------------------

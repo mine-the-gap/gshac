@@ -488,7 +488,9 @@ def spatial_dist_graph(
     Returns
     -------
     dict with keys ``matrix``, ``components``, ``n_components``, ``n_edges``,
-    ``density``. See module docstring for details.
+    ``density``, ``metric`` (the resolved metric, used by ``sparse_hclust`` to
+    recompute exact per-component sub-matrices for non-single linkage). See
+    module docstring for details.
 
     Raises
     ------
@@ -544,6 +546,7 @@ def spatial_dist_graph(
             n_components=n_comp,
             n_edges=0,
             density=0.0,
+            metric=resolved_metric,
         )
 
     # Replace co-located points (dist == 0) with 1 m.
@@ -563,6 +566,7 @@ def spatial_dist_graph(
         n_components=n_comp,
         n_edges=len(pairs),
         density=len(pairs) / (n * (n - 1) / 2),
+        metric=resolved_metric,
     )
 
 
