@@ -30,6 +30,13 @@ python3 setup.py build_ext --inplace
 
 The library falls back to pure Python if the C extension is not built.
 
+To install a specific **pinned release** directly (e.g. for reproducibility — this is what
+the paper's benchmark pipeline pins), use the release tag:
+
+```bash
+pip install "gshac[plot,geo] @ git+https://github.com/mine-the-gap/gshac.git@1.0.1"
+```
+
 ### Extras
 
 ```bash
@@ -158,6 +165,22 @@ pytest tests/ -v
 | `geographic_connectivity(coords, h_max, metric, crs)` | Binary connectivity matrix for sklearn |
 | `plot_dendrogram(model_or_result, ...)` | Plot dendrogram from estimator or result |
 | `plot_component_dendrograms(result, top_k)` | Plot dendrograms for largest components |
+
+## Citation
+
+If you use GSHAC, please cite:
+
+> Maus, V., & Pozzobon Borin, V. (2026). *Scalable Exact Hierarchical Agglomerative
+> Clustering via Sparse Geographic Distance Graphs.* arXiv:2604.11656.
+> [https://doi.org/10.48550/arXiv.2604.11656](https://doi.org/10.48550/arXiv.2604.11656)
+
+The method was first introduced and applied to global mining land-use in:
+
+> Maus, V. (2026). *A data-driven approach to mapping global commodity-specific
+> mining land-use.* Journal of Cleaner Production, 540, 147437.
+> [https://doi.org/10.1016/j.jclepro.2025.147437](https://doi.org/10.1016/j.jclepro.2025.147437)
+
+See [`CITATION.cff`](CITATION.cff) for machine-readable metadata.
 
 ## Acknowledgements
 
