@@ -1,5 +1,7 @@
 """Tests for sparse_hclust, dense_hclust, stitch_linkage, and the sklearn API."""
 
+import warnings
+
 import numpy as np
 import pytest
 from scipy.cluster.hierarchy import fcluster, linkage
@@ -208,6 +210,138 @@ def test_average_without_coords_warns_and_validates_shape():
     with pytest.raises(ValueError, match=r"coords must be shape"):
         sparse_hclust(graph, h_cuts=[10_000], method="average",
                       coords=coords[:, :1])
+
+
+def _chain_with_long_intra_pairs():
+    """A single connected component whose graph omits intra-component pairs.
+
+    Points are spaced so that consecutive points are within ``h_max`` (chain
+    connectivity, one component) but the endpoints are farther apart than
+    ``h_max``. The threshold graph therefore drops those long intra-component
+    pairs, so the no-coords dense reconstruction must fill them with a
+    sentinel (``zero_mask.any()`` is True). Returns ``(coords, graph, h_max)``.
+    """
+    # 6 collinear points, 4 km apart; h_max=5 km links neighbours only.
+    coords = np.array([[float(i) * 4_000.0, 0.0] for i in range(6)])
+    h_max = 5_000.0
+    graph = spatial_dist_graph(coords, h_max=h_max)
+    assert graph["n_components"] == 1, "must be a single connected component"
+    return coords, graph, h_max
+
+
+@pytest.mark.parametrize("method", ["complete", "ward"])
+def test_no_coords_fallback_non_average_sentinel(method):
+    """No-coords dense fallback for non-average linkage hits the sentinel fill.
+
+    Exercises the ``method != "average"`` branch of the absent-pair sentinel
+    fill (no UserWarning is raised). The chained component has intra-component
+    pairs beyond ``h_max`` that the threshold graph omits, so ``zero_mask`` is
+    non-empty and the sentinel-fill path runs.
+    """
+    coords, graph, _ = _chain_with_long_intra_pairs()
+    # Must NOT warn for non-average linkage.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # turn any warning into an error
+        result = sparse_hclust(graph, h_cuts=[4_500], method=method)
+    labels = result["labels"][4_500.0]
+    assert labels.shape == (6,)
+    # The two chain endpoints (> h_max apart) must never share a cluster at a
+    # cut height <= h_max: the sentinel keeps them separated.
+    assert labels[0] != labels[-1]
+
+
+def test_geodesic_full_distance_matrix_matches_pyproj():
+    """The geodesic _full_distance_matrix equals an independent pyproj.Geod ref."""
+    pyproj = pytest.importorskip("pyproj")
+    from gshac.sparse_hclust import _full_distance_matrix
+
+    rng = np.random.default_rng(3)
+    coords = np.column_stack([rng.uniform(-1.0, 1.0, 40),
+                              rng.uniform(50.0, 51.0, 40)])
+    geod = pyproj.Geod(ellps="WGS84")
+    n = len(coords)
+    ref = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            _, _, d = geod.inv(coords[i, 0], coords[i, 1],
+                               coords[j, 0], coords[j, 1])
+            ref[i, j] = ref[j, i] = d
+
+    fdm = _full_distance_matrix(coords, "geodesic")
+    assert fdm.shape == (n, n)
+    np.testing.assert_allclose(np.diag(fdm), 0.0, atol=1e-9)
+    np.testing.assert_allclose(fdm, ref, rtol=1e-9, atol=1e-6)
+
+
+@pytest.mark.parametrize("method", ["complete", "average", "ward"])
+def test_geodesic_coords_path_matches_dense_reference(backend, method):
+    """Exact non-single linkage on a geodesic graph via the coords= path.
+
+    dense_hclust has no geodesic backend, so the reference is a dense scipy
+    linkage built from a full geodesic distance matrix computed independently
+    with pyproj.Geod. For complete/average/ward, cross-component pairs are all
+    > h_max, so the per-component coords= result must match the dense reference.
+    """
+    pyproj = pytest.importorskip("pyproj")
+    from scipy.cluster.hierarchy import linkage as _scipy_linkage
+
+    rng = np.random.default_rng(8)
+    coords = np.column_stack([rng.uniform(-1.0, 1.0, 90),
+                              rng.uniform(50.0, 51.0, 90)])
+    h_max = 40_000
+    h_cuts = [10_000, 20_000]
+
+    geod = pyproj.Geod(ellps="WGS84")
+    n = len(coords)
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            _, _, d = geod.inv(coords[i, 0], coords[i, 1],
+                               coords[j, 0], coords[j, 1])
+            D[i, j] = D[j, i] = d
+
+    graph = spatial_dist_graph(coords, h_max=h_max, metric="geodesic")
+    sp = sparse_hclust(graph, h_cuts=h_cuts, method=method, coords=coords)
+
+    Zref = _scipy_linkage(squareform(D, checks=False), method=method)
+    for h in h_cuts:
+        n_sp = len(np.unique(sp["labels"][float(h)]))
+        n_ref = len(np.unique(fcluster(Zref, t=h, criterion="distance")))
+        assert n_sp == n_ref, f"{method} geodesic mismatch at h={h}: {n_sp} vs {n_ref}"
+
+
+def test_full_distance_matrix_unknown_metric_raises():
+    """_full_distance_matrix rejects an unknown metric with a clear ValueError."""
+    from gshac.sparse_hclust import _full_distance_matrix
+
+    coords = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]])
+    with pytest.raises(ValueError, match=r"Unknown metric for exact sub-matrix"):
+        _full_distance_matrix(coords, "manhattan")
+
+
+def test_unknown_graph_metric_propagates_to_full_distance_matrix():
+    """A graph carrying an unknown metric raises via the coords= dense path.
+
+    The metric stored on the graph dict is what sparse_hclust passes to
+    _full_distance_matrix; an unsupported value surfaces as a ValueError from
+    the non-single (coords=) dense path, not a silent wrong answer.
+    """
+    coords, graph, _ = _chain_with_long_intra_pairs()
+    graph = dict(graph)            # shallow copy; don't mutate the fixture graph
+    graph["metric"] = "manhattan"  # unsupported by _full_distance_matrix
+    with pytest.raises(ValueError, match=r"Unknown metric for exact sub-matrix"):
+        sparse_hclust(graph, h_cuts=[4_500], method="complete", coords=coords)
+
+
+def test_euclidean_full_distance_matrix_matches_cdist():
+    """The euclidean _full_distance_matrix branch equals scipy cdist."""
+    from scipy.spatial.distance import cdist
+    from gshac.sparse_hclust import _full_distance_matrix
+
+    rng = np.random.default_rng(1)
+    coords = rng.uniform(0, 10_000, size=(25, 2))
+    fdm = _full_distance_matrix(coords, "euclidean")
+    np.testing.assert_allclose(fdm, cdist(coords, coords, metric="euclidean"))
 
 
 # ---------------------------------------------------------------------------
