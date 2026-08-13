@@ -8,7 +8,7 @@ abstract: >-
   each connected component independently, with a scikit-learn-compatible
   SparseAgglomerativeClustering estimator.
 type: software
-version: 1.0.1
+version: 1.0.2
 date-released: "2026-06-18"
 authors:
   - family-names: Maus

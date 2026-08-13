@@ -549,7 +549,13 @@ def spatial_dist_graph(
             metric=resolved_metric,
         )
 
-    # Replace co-located points (dist == 0) with 1 m.
+    # Co-located points (dist == 0) would vanish from the CSR matrix, since
+    # scipy sparse treats explicit zeros as absent entries — silently
+    # disconnecting exact duplicates (common in e.g. GeoNames). Store them as
+    # 1 unit (1 m for metric CRS) instead: duplicates then merge at height 1
+    # rather than 0, which is far below any realistic cut height. Note this
+    # value is in the coordinate/metric units, and that the coords-based dense
+    # path (_full_distance_matrix) keeps the true 0.0 for such pairs.
     dists = np.where(dists == 0.0, 1.0, dists)
 
     i_idx = pairs[:, 0]

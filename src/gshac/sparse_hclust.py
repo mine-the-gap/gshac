@@ -213,13 +213,15 @@ def sparse_hclust(
         matrix compatible with :func:`scipy.cluster.hierarchy.dendrogram`.
     coords : ndarray of shape (n, 2), optional
         The coordinates the graph was built from, in the same order. Required
-        for **exact average linkage** (and makes complete/Ward exact in
-        general): the per-component sub-matrix is recomputed from these
+        for **exact average linkage** (and gives complete/Ward the true
+        distances): the per-component sub-matrix is recomputed from these
         coordinates using the graph's metric, recovering the intra-component
         distances beyond ``h_max`` that the threshold graph omits. Ignored for
         single linkage. If omitted, non-single linkage falls back to a
-        threshold-graph + sentinel reconstruction — exact for single, complete,
-        and Ward, but approximate for average (a ``UserWarning`` is raised).
+        threshold-graph + sentinel reconstruction — still exact for complete
+        linkage at cuts <= h_max (the sentinel provably exceeds h_max),
+        heuristic for Ward, and approximate for average (a ``UserWarning``
+        is raised).
 
     Returns
     -------
@@ -537,7 +539,11 @@ if _SKLEARN:
         """
         Hierarchical clustering of spatial data via a sparse geographic distance
         graph.  Produces identical results to AgglomerativeClustering for any cut
-        height h <= h_max, with O(n·k) memory instead of O(n²).
+        height h <= h_max for single, complete, and average linkage, with
+        O(n·k) graph memory instead of O(n²).  Ward linkage matches the dense
+        result for spatially compact clusters but carries no general exactness
+        guarantee (its merge criterion is not bounded below by the minimum
+        inter-point distance).
 
         Designed to be a drop-in replacement for::
 
@@ -640,8 +646,12 @@ if _SKLEARN:
             )
 
             graph = spatial_dist_graph(X, self.h_max, metric=self.metric)
+            # Pass coords so non-single linkages recompute each component's
+            # full distance sub-matrix from coordinates (exact path). Without
+            # this, average linkage would fall back to the sentinel
+            # reconstruction, which is approximate.
             result = sparse_hclust(graph, [h_cut], method=self.linkage,
-                                   return_linkage=True)
+                                   return_linkage=True, coords=X)
 
             self.labels_ = result["labels"][h_cut]
             self.n_clusters_ = int(np.unique(self.labels_).size)

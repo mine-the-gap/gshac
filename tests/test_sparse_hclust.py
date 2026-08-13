@@ -497,6 +497,32 @@ def test_sklearn_api_exposes_linkage(small_clustered_coords):
     assert model.distances_.shape == (n - 1,)
 
 
+@pytest.mark.parametrize("method", ["average", "complete", "ward"])
+def test_sklearn_api_uses_exact_coords_path(method):
+    """The estimator must take the exact coords= dense path, not the sentinel.
+
+    Regression test: fit() previously did not forward coordinates to
+    sparse_hclust, so non-single linkages fell back to the sentinel
+    reconstruction — approximate for average linkage (with a UserWarning).
+    Uses the chain geometry so the component contains intra-component pairs
+    beyond h_max: exactly the case where the two paths differ.
+    """
+    coords, _, h_max = _chain_with_long_intra_pairs()
+    h_cut = 4_500.0
+
+    # (a) No approximation warning may be raised through the estimator.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        model = SparseAgglomerativeClustering(
+            h_max=h_max, distance_threshold=h_cut, linkage=method
+        )
+        model.fit(coords)
+
+    # (b) Partition must equal dense HAC on the full distance matrix.
+    dense = dense_hclust(coords, h_cuts=[h_cut], method=method)
+    assert adjusted_rand_score(model.labels_, dense["labels"][h_cut]) == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Linkage method correctness: sparse_hclust vs scipy for each HAC method
 #
