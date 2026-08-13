@@ -180,6 +180,21 @@ def _build_Z_from_mst(sub_csr: csr_matrix, size: int) -> np.ndarray:
     return Z
 
 
+def _geos_full_matrix(geoms: np.ndarray) -> np.ndarray:
+    """Full pairwise GEOS boundary-to-boundary distance matrix.
+
+    Exact minimum distances between geometry point sets (0 for touching or
+    overlapping features), computed with shapely 2's vectorised ``distance``
+    ufunc via broadcasting. O(m^2) kernel calls for an m-feature component —
+    the same asymptotics as the coordinate-based recomputation, with a
+    higher per-pair constant.
+    """
+    import shapely
+
+    sub = shapely.distance(geoms[:, None], geoms[None, :])
+    return np.asarray(sub, dtype=np.float64)
+
+
 def sparse_hclust(
     graph: dict,
     h_cuts: Sequence[float],
@@ -221,7 +236,10 @@ def sparse_hclust(
         threshold-graph + sentinel reconstruction — still exact for complete
         linkage at cuts <= h_max (the sentinel provably exceeds h_max),
         heuristic for Ward, and approximate for average (a ``UserWarning``
-        is raised).
+        is raised). Ignored for non-point geometry graphs: those carry
+        their geometries in ``graph["geometries"]`` and always recompute
+        exact per-component GEOS distance sub-matrices (Ward is refused for
+        non-point geometries, as it requires a Euclidean embedding).
 
     Returns
     -------
@@ -242,6 +260,16 @@ def sparse_hclust(
     components = graph["components"]
     n          = mat.shape[0]
     metric     = graph.get("metric", "euclidean")
+    geoms      = graph.get("geometries")
+
+    if geoms is not None and method == "ward":
+        raise ValueError(
+            "Ward linkage requires point features: its merge criterion is "
+            "defined on a Euclidean embedding (centroids and variances), "
+            "which boundary-to-boundary distances between lines/polygons "
+            "do not provide. Use 'single', 'complete', or 'average' "
+            "linkage for non-point geometries."
+        )
 
     coords_arr = None
     if coords is not None:
@@ -301,7 +329,16 @@ def sparse_hclust(
                 Z = _build_Z_from_mst(sub_csr, size)
         else:
             # Dense path for complete / average / Ward linkage.
-            if coords_arr is not None:
+            if geoms is not None:
+                # Non-point geometries: recompute the full per-component
+                # matrix of GEOS boundary-to-boundary distances (exact,
+                # including intra-component pairs beyond h_max). Note that
+                # touching/overlapping pairs have a true distance of 0 here,
+                # whereas the threshold graph stores them as 1 unit (CSR
+                # cannot hold explicit zeros); both merge far below any
+                # realistic cut height.
+                sub = _geos_full_matrix(geoms[idx])
+            elif coords_arr is not None:
                 # Exact: recompute the full per-component distance matrix from
                 # coordinates with the graph's metric. The threshold graph omits
                 # > h_max intra-component pairs, whose true distances drive

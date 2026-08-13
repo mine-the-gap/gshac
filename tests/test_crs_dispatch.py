@@ -168,14 +168,27 @@ def test_crs_argument_matching_geopandas_crs_is_accepted(lonlat_gdf):
 # Non-Point geometries
 # ---------------------------------------------------------------------------
 
-def test_non_point_geometry_raises():
+def test_non_point_geometry_geographic_crs_raises():
+    # Non-point geometries are supported since 1.1.0 via the GEOS path,
+    # but only for projected CRSs (GEOS distances are planar): geographic
+    # CRS input must raise with a reprojection hint.
     lines = [LineString([(0, 0), (1, 1)]) for _ in range(5)]
     gdf = gpd.GeoDataFrame(geometry=lines, crs="EPSG:4326")
-    with pytest.raises(NotImplementedError) as ei:
+    with pytest.raises(ValueError, match="projected CRS"):
         spatial_dist_graph(gdf, h_max=10_000)
-    msg = ei.value.args[0]
-    # The message should point users at representative_point or centroid.
-    assert "representative_point" in msg or "centroid" in msg
+
+
+def test_non_point_geometry_projected_crs_works():
+    lines = [
+        LineString([(0, 0), (1_000, 0)]),
+        LineString([(1_500, 0), (2_500, 0)]),
+        LineString([(90_000, 0), (91_000, 0)]),
+    ]
+    gdf = gpd.GeoDataFrame(geometry=lines, crs="EPSG:3857")
+    g = spatial_dist_graph(gdf, h_max=1_000)
+    assert g["feature_type"] == "geometry"
+    assert g["matrix"][0, 1] == 500.0
+    assert g["n_components"] == 2
 
 
 # ---------------------------------------------------------------------------

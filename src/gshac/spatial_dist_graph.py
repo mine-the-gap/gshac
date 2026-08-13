@@ -141,16 +141,19 @@ def _crs_kind(crs: Any) -> str:
 def _resolve_inputs(
     coords: Any,
     crs: Any,
-) -> Tuple[np.ndarray, Optional[Any]]:
-    """Normalise ``coords`` and ``crs`` into ``(ndarray, pyproj.CRS|None)``.
+) -> Tuple[Optional[np.ndarray], Optional[Any], Optional[np.ndarray]]:
+    """Normalise ``coords``/``crs`` into ``(ndarray|None, CRS|None, geoms|None)``.
 
-    Accepts a raw ``(n, 2)`` ndarray, a ``geopandas.GeoSeries`` of points,
-    or a ``geopandas.GeoDataFrame``. If ``coords`` carries its own CRS,
-    the user-supplied ``crs=`` must either be ``None`` or match exactly —
-    a mismatch indicates a copy-paste bug, not a useful override.
+    Accepts a raw ``(n, 2)`` ndarray, a ``geopandas.GeoSeries``, or a
+    ``geopandas.GeoDataFrame``. All-Point inputs yield a coordinate array
+    (``geoms`` is None); inputs with lines/polygons yield ``geoms`` (an
+    object ndarray of shapely geometries) with ``arr`` None. If ``coords``
+    carries its own CRS, the user-supplied ``crs=`` must either be ``None``
+    or match exactly — a mismatch indicates a copy-paste bug, not a useful
+    override.
     """
-    geo_coords, geo_crs = _try_extract_from_geopandas(coords)
-    if geo_coords is not None:
+    geo_coords, geo_crs, geo_geoms = _try_extract_from_geopandas(coords)
+    if geo_coords is not None or geo_geoms is not None:
         if crs is not None:
             user_crs = _coerce_crs(crs)
             if geo_crs is None:
@@ -163,33 +166,34 @@ def _resolve_inputs(
                     f"input: argument={user_crs!r} vs input.crs={geo_crs!r}. "
                     "Pass crs=None or omit to inherit the input's CRS."
                 )
-        return geo_coords, geo_crs
+        return geo_coords, geo_crs, geo_geoms
 
     arr = np.asarray(coords, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] != 2:
         raise ValueError(
             f"coords must be shape (n, 2); got shape {arr.shape!r}."
         )
-    return arr, _coerce_crs(crs)
+    return arr, _coerce_crs(crs), None
 
 
 def _try_extract_from_geopandas(
     coords: Any,
-) -> Tuple[Optional[np.ndarray], Optional[Any]]:
-    """If ``coords`` is a geopandas object, return ``(arr, crs)``.
+) -> Tuple[Optional[np.ndarray], Optional[Any], Optional[np.ndarray]]:
+    """If ``coords`` is a geopandas object, return ``(arr, crs, geoms)``.
 
-    Otherwise return ``(None, None)``. ``geopandas`` is imported lazily so
-    that gshac remains importable without the ``[geo]`` extras.
+    Otherwise return ``(None, None, None)``. ``geopandas`` is imported
+    lazily so that gshac remains importable without the ``[geo]`` extras.
 
-    Non-Point geometries raise ``NotImplementedError`` with a message
-    pointing at ``representative_point()`` / ``centroid``. Point-only is
-    intentional for v0.x: HAC on lines and polygons requires a Hausdorff
-    or Frechet kernel that is out of scope for this release.
+    All-Point inputs take the coordinate fast path: ``arr`` is the
+    ``(n, 2)`` coordinate array and ``geoms`` is ``None``. Inputs
+    containing any non-Point geometry (lines, polygons, multi-parts)
+    return ``arr=None`` and ``geoms`` as an object ndarray of shapely
+    geometries, routed to the GEOS boundary-to-boundary distance path.
     """
     # Check by class name first to avoid importing geopandas for ndarray inputs.
     cls_name = type(coords).__name__
     if cls_name not in ("GeoSeries", "GeoDataFrame"):
-        return None, None
+        return None, None, None
 
     try:
         import geopandas as gpd
@@ -204,23 +208,18 @@ def _try_extract_from_geopandas(
     elif isinstance(coords, gpd.GeoSeries):
         geom = coords
     else:  # pragma: no cover - defensive, matched by class-name check above
-        return None, None
+        return None, None, None
 
     geom_types = set(geom.geom_type.unique())
     if geom_types - {"Point"}:
-        raise NotImplementedError(
-            "Only Point geometries are supported in v0.x; got "
-            f"{sorted(geom_types)!r}. For polygons/lines, use "
-            "`geom.representative_point()` or `geom.centroid` to obtain a "
-            "Point approximation. Hausdorff/Frechet distance for non-point "
-            "geometries is future work."
-        )
+        # Non-point geometries: GEOS boundary-to-boundary distance path.
+        return None, geom.crs, geom.to_numpy()
 
     # Extract (x, y) — this is (lon, lat) for geographic CRSs.
     xs = geom.x.to_numpy(dtype=np.float64)
     ys = geom.y.to_numpy(dtype=np.float64)
     arr = np.column_stack([xs, ys])
-    return arr, geom.crs
+    return arr, geom.crs, None
 
 
 def _resolve_metric(metric: str, crs_kind: str) -> str:
@@ -438,6 +437,73 @@ def _geodesic_pairs(
     return pairs[keep], dists[keep]
 
 
+def _geos_pairs_within(geoms: np.ndarray, h_max: float):
+    """All geometry pairs with boundary-to-boundary distance <= h_max.
+
+    Uses a GEOS STRtree bulk query with the ``dwithin`` predicate
+    (shapely >= 2.0, GEOS >= 3.10), which evaluates the TRUE minimum
+    distance between the geometries — not a bounding-box approximation —
+    so the returned pair set is complete and the exactness guarantee of
+    the component decomposition carries over unchanged. Distances are the
+    planar GEOS minimum distances between the two geometries' point sets;
+    touching or overlapping features have distance 0, matching the
+    convention of GEOS/JTS, sf::st_distance, and PostGIS ST_Distance.
+
+    Returns ``(pairs, dists)`` with ``pairs`` of shape (k, 2) (i < j).
+    """
+    import shapely
+
+    if not hasattr(shapely, "STRtree") or shapely.geos_version < (3, 10, 0):
+        raise ImportError(
+            "non-point geometries require shapely >= 2.0 with GEOS >= 3.10 "
+            f"(found GEOS {getattr(shapely, 'geos_version', None)!r})."
+        )
+    tree = shapely.STRtree(geoms)
+    i_idx, j_idx = tree.query(geoms, predicate="dwithin", distance=float(h_max))
+    keep = i_idx < j_idx  # drop self-pairs and symmetric duplicates
+    i_idx, j_idx = i_idx[keep], j_idx[keep]
+    if len(i_idx) == 0:
+        return np.empty((0, 2), dtype=np.int64), np.empty(0, dtype=np.float64)
+    dists = shapely.distance(geoms[i_idx], geoms[j_idx]).astype(np.float64)
+    pairs = np.column_stack([i_idx, j_idx]).astype(np.int64)
+    return pairs, dists
+
+
+def _resolve_geometry_metric(metric: str, kind: Optional[str], crs: Any) -> str:
+    """Validate the (metric, CRS) combination for non-point geometries.
+
+    Boundary-to-boundary distances are computed by GEOS, which is planar:
+    a projected CRS (or a missing CRS, assumed planar with a warning) is
+    required. Geodesic/haversine distances between lines/polygons are not
+    supported — project first.
+    """
+    global _MISSING_CRS_WARNED
+    if metric not in ("auto", "euclidean"):
+        raise ValueError(
+            f"metric={metric!r} is not supported for non-point geometries: "
+            "boundary-to-boundary distances are computed by GEOS (planar). "
+            "Use a projected CRS with metric='euclidean' or 'auto'."
+        )
+    if kind == "geographic":
+        raise ValueError(
+            "non-point geometries require a projected CRS: GEOS distances "
+            "are planar, and geodesic distances between lines/polygons are "
+            "not supported. Reproject first (e.g. to a suitable local "
+            "projected CRS in metre units)."
+        )
+    if kind is None:
+        if not _MISSING_CRS_WARNED:
+            warnings.warn(
+                "no CRS provided for geometry input; assuming planar "
+                "coordinates in metre-compatible units.",
+                UserWarning, stacklevel=3,
+            )
+            _MISSING_CRS_WARNED = True
+    else:
+        _check_metre_units(crs)
+    return "euclidean"
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -453,13 +519,19 @@ def spatial_dist_graph(
     Parameters
     ----------
     coords : ndarray of shape (n, 2), or geopandas.GeoSeries, or geopandas.GeoDataFrame
-        Feature coordinates. For a ndarray with a geographic CRS the
-        ordering is ``(longitude, latitude)`` in degrees; for a projected
-        CRS, ``(x, y)`` in the CRS's linear units (metres assumed for
-        ``h_max`` to be meaningful — see Notes). For ``GeoSeries`` /
-        ``GeoDataFrame`` inputs, only Point geometries are supported in
-        v0.x; non-Point inputs raise ``NotImplementedError`` with a
-        suggestion to use ``representative_point()`` or ``centroid``.
+        Feature coordinates or geometries. For a ndarray with a geographic
+        CRS the ordering is ``(longitude, latitude)`` in degrees; for a
+        projected CRS, ``(x, y)`` in the CRS's linear units (metres assumed
+        for ``h_max`` to be meaningful — see Notes). ``GeoSeries`` /
+        ``GeoDataFrame`` inputs may contain any geometry type: all-Point
+        inputs take the coordinate fast path, while lines, polygons, and
+        multi-part geometries are handled via GEOS boundary-to-boundary
+        minimum distances (STRtree ``dwithin`` range queries). Non-point
+        geometries require a projected CRS (GEOS is planar); touching or
+        overlapping features have distance 0, following the GEOS / ``sf`` /
+        PostGIS convention. The algorithm is unchanged for geometries —
+        only the range query and distance kernel differ — but the per-pair
+        kernel cost is higher than for points.
     h_max : float
         Maximum distance threshold. Metres for ``"haversine"``, ``"geodesic"``,
         and ``"euclidean"`` on a metre-unit projected CRS. For ``"euclidean"``
@@ -498,9 +570,9 @@ def spatial_dist_graph(
         If ``coords`` has fewer than 2 points, the metric is unknown, or the
         ``(metric, CRS)`` combination is invalid (e.g. ``"euclidean"`` on a
         geographic CRS, or ``"haversine"``/``"geodesic"`` on a projected CRS).
-    NotImplementedError
-        If a non-Point geometry is passed via ``GeoSeries`` /
-        ``GeoDataFrame``.
+        For non-point geometries: also if the CRS is geographic or the
+        metric is ``"haversine"``/``"geodesic"`` (GEOS distances are
+        planar; reproject first).
     ImportError
         If ``metric`` resolves to ``"geodesic"`` but ``pyproj`` is not
         installed, or a geopandas input is passed but ``geopandas`` is not
@@ -513,28 +585,36 @@ def spatial_dist_graph(
     ``crs=`` is byte-identical to the pre-CRS-aware behaviour. The paper's
     benchmark numbers depend on this.
     """
-    arr, resolved_crs = _resolve_inputs(coords, crs)
-    n = len(arr)
+    arr, resolved_crs, geoms = _resolve_inputs(coords, crs)
+    n = len(geoms) if geoms is not None else len(arr)
     if n < 2:
         raise ValueError("coords must have at least 2 features")
 
     kind = _crs_kind(resolved_crs)
-    resolved_metric = _resolve_metric(metric, kind)
 
-    # Optional unit check for projected CRSs — a non-metre unit silently
-    # changes what h_max means, which is a footgun.
-    if resolved_metric == "euclidean":
-        _check_metre_units(resolved_crs)
+    if geoms is not None:
+        # Non-point geometries: GEOS boundary-to-boundary distance path.
+        # Same algorithm, different range query + distance kernel; the
+        # per-pair kernel cost is higher than for point coordinates.
+        resolved_metric = _resolve_geometry_metric(metric, kind, resolved_crs)
+        pairs, dists = _geos_pairs_within(geoms, h_max)
+    else:
+        resolved_metric = _resolve_metric(metric, kind)
 
-    # --- candidate pairs + exact distances ---------------------------------
-    if resolved_metric == "euclidean":
-        pairs, dists = _euclidean_pairs(arr, h_max)
-    elif resolved_metric == "haversine":
-        pairs, dists = _haversine_pairs(arr, h_max)
-    elif resolved_metric == "geodesic":
-        pairs, dists = _geodesic_pairs(arr, h_max)
-    else:  # pragma: no cover
-        raise AssertionError(f"unreachable: metric={resolved_metric!r}")
+        # Optional unit check for projected CRSs — a non-metre unit silently
+        # changes what h_max means, which is a footgun.
+        if resolved_metric == "euclidean":
+            _check_metre_units(resolved_crs)
+
+        # --- candidate pairs + exact distances -----------------------------
+        if resolved_metric == "euclidean":
+            pairs, dists = _euclidean_pairs(arr, h_max)
+        elif resolved_metric == "haversine":
+            pairs, dists = _haversine_pairs(arr, h_max)
+        elif resolved_metric == "geodesic":
+            pairs, dists = _geodesic_pairs(arr, h_max)
+        else:  # pragma: no cover
+            raise AssertionError(f"unreachable: metric={resolved_metric!r}")
 
     # --- empty result -------------------------------------------------------
     if len(pairs) == 0:
@@ -547,6 +627,8 @@ def spatial_dist_graph(
             n_edges=0,
             density=0.0,
             metric=resolved_metric,
+            feature_type="geometry" if geoms is not None else "point",
+            geometries=geoms,
         )
 
     # Co-located points (dist == 0) would vanish from the CSR matrix, since
@@ -573,6 +655,11 @@ def spatial_dist_graph(
         n_edges=len(pairs),
         density=len(pairs) / (n * (n - 1) / 2),
         metric=resolved_metric,
+        # Non-point graphs carry their geometries so sparse_hclust can
+        # recompute exact per-component sub-matrices for non-single linkage
+        # without the caller re-passing them.
+        feature_type="geometry" if geoms is not None else "point",
+        geometries=geoms,
     )
 
 
