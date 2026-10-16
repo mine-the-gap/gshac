@@ -34,7 +34,7 @@ To install a specific **pinned release** directly (e.g. for reproducibility — 
 the paper's benchmark pipeline pins), use the release tag:
 
 ```bash
-pip install "gshac[plot,geo] @ git+https://github.com/mine-the-gap/gshac.git@1.0.1"
+pip install "gshac[plot,geo] @ git+https://github.com/mine-the-gap/gshac.git@1.1.0"
 ```
 
 ### Extras
@@ -196,4 +196,4 @@ GPL-3.0. See [LICENSE](LICENSE).
 
 ## Funding
 
-Funded by the European Union. This work was supported by the European Research Council (ERC) project MINE-THE-GAP [https://minethegap.eu](https://minethegap.eu) (grant agreement no. 101170578 [10.3030/101170578](https://doi.org/10.3030/101170578). Views and opinions expressed are however those of the author only and do not necessarily reflect those of the European Union or the European Research Council Executive Agency. Neither the European Union nor the granting authority can be held responsible for them.
+Funded by the European Union. This work was supported by the European Research Council (ERC) project MINE-THE-GAP [https://minethegap.eu](https://minethegap.eu) (grant agreement no. 101170578 [10.3030/101170578](https://doi.org/10.3030/101170578)). Views and opinions expressed are however those of the author only and do not necessarily reflect those of the European Union or the European Research Council Executive Agency. Neither the European Union nor the granting authority can be held responsible for them.
